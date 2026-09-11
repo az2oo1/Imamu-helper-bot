@@ -2,10 +2,7 @@ version: '3.8'
 
 services:
   whatsapp-bot:
-    image: ${BOT_IMAGE:-ghcr.io/az2oo1/imamu-helper-bot:latest}
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/az2oo1/imamu-helper-bot:latest
     container_name: imamu_whatsapp_bot
     restart: unless-stopped
     ports:
