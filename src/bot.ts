@@ -15,6 +15,20 @@ import { config } from './config';
 import { db } from './db';
 import { extractPhoneNumberFromJid, formatPhoneForDisplay, isLidJid } from './phoneUtils';
 
+/**
+ * Timeout wrapper to prevent any single WhatsApp socket operation from hanging execution.
+ */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, defaultValue: T): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeoutPromise = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(defaultValue), timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timer);
+  });
+}
+
 export class WhatsAppBot {
   private sock: WASocket | null = null;
   private isConnected: boolean = false;
@@ -36,12 +50,11 @@ export class WhatsAppBot {
 
     this.sock = makeWASocket({
       auth: state,
-      printQRInTerminal: !config.bot.usePairingCode,
       logger: this.logger as any,
       syncFullHistory: false,    // Disable full history download to prevent 408 init query timeouts
       fireInitQueries: false,    // Skip optional init queries for faster & stable connection
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 60000,
+      connectTimeoutMs: 30000,
+      defaultQueryTimeoutMs: 30000,
     });
 
     this.sock.ev.on('creds.update', saveCreds);
@@ -124,7 +137,7 @@ export class WhatsAppBot {
   private async refreshLidMapFromGroups(): Promise<void> {
     if (!this.sock || !this.isConnected) return;
     try {
-      const groups = await this.sock.groupFetchAllParticipating();
+      const groups = await withTimeout(this.sock.groupFetchAllParticipating(), 10000, {});
       for (const group of Object.values(groups)) {
         if (group.participants) {
           for (const p of group.participants) {
@@ -142,50 +155,27 @@ export class WhatsAppBot {
   }
 
   /**
-   * Fetch all pending membership approval requests for a group, specifying limit=100 to ensure complete lists.
+   * Fetch full group metadata for a group to extract participant LIDs and mapping.
    */
-  public async fetchPendingRequestsForGroup(groupJid: string): Promise<any[]> {
-    if (!this.sock) return [];
-
-    // Try sending explicit limit=100 query first to prevent WhatsApp default result capping
+  private async fetchGroupLidMap(groupJid: string): Promise<void> {
+    if (!this.sock || !groupJid) return;
     try {
-      const result = await this.sock.query({
-        tag: 'iq',
-        attrs: {
-          type: 'get',
-          xmlns: 'w:g2',
-          to: groupJid
-        },
-        content: [
-          {
-            tag: 'membership_approval_requests',
-            attrs: { limit: '100' }
+      const meta = await withTimeout(this.sock.groupMetadata(groupJid), 5000, null as any);
+      if (meta && meta.participants) {
+        for (const p of meta.participants) {
+          const phone = extractPhoneNumberFromJid(p.id || p.jid || '');
+          if (p.lid && phone) {
+            this.lidToPnMap.set(p.lid, phone);
           }
-        ]
-      });
-
-      const node = getBinaryNodeChild(result, 'membership_approval_requests');
-      const participants = getBinaryNodeChildren(node, 'membership_approval_request');
-      const list = participants.map(v => v.attrs);
-      if (list && list.length > 0) {
-        return list;
+        }
       }
-    } catch (err) {
-      // Query with limit notice
-    }
-
-    // Fallback to standard Baileys method if custom limit query fails or returns empty
-    try {
-      return await this.sock.groupRequestParticipantsList(groupJid);
-    } catch (err) {
-      return [];
-    }
+    } catch (err) {}
   }
 
   /**
    * Resolves a JID (which may be an LID or a standard @s.whatsapp.net JID) into a numeric phone number.
    */
-  private async resolvePhoneFromJid(jid: string, rawRequestObj?: any): Promise<string> {
+  private async resolvePhoneFromJid(jid: string, rawRequestObj?: any, groupJid?: string): Promise<string> {
     if (!jid) return '';
 
     // 1. If extra properties contain explicit phone number / PN attribute
@@ -207,10 +197,18 @@ export class WhatsAppBot {
       return this.lidToPnMap.get(jid)!;
     }
 
-    // 4. Perform USync IQ query to WhatsApp server to resolve LID -> Phone Number
+    // 4. Try fetching group metadata for LID map
+    if (groupJid) {
+      await this.fetchGroupLidMap(groupJid);
+      if (this.lidToPnMap.has(jid)) {
+        return this.lidToPnMap.get(jid)!;
+      }
+    }
+
+    // 5. Perform USync IQ query with a 3-second timeout
     if (this.sock) {
       try {
-        const result = await this.sock.query({
+        const usyncPromise = this.sock.query({
           tag: 'iq',
           attrs: {
             to: S_WHATSAPP_NET,
@@ -245,21 +243,24 @@ export class WhatsAppBot {
           ]
         });
 
-        const usyncNode = getBinaryNodeChild(result, 'usync');
-        const listNode = getBinaryNodeChild(usyncNode, 'list');
-        const userNode = getBinaryNodeChild(listNode, 'user');
-        const contactNode = getBinaryNodeChild(userNode, 'contact');
+        const result = await withTimeout(usyncPromise, 3000, null);
+        if (result) {
+          const usyncNode = getBinaryNodeChild(result, 'usync');
+          const listNode = getBinaryNodeChild(usyncNode, 'list');
+          const userNode = getBinaryNodeChild(listNode, 'user');
+          const contactNode = getBinaryNodeChild(userNode, 'contact');
 
-        const phoneAttr = contactNode?.attrs?.phone || userNode?.attrs?.jid || userNode?.attrs?.phone_number;
-        if (phoneAttr) {
-          const phone = extractPhoneNumberFromJid(phoneAttr);
-          if (phone) {
-            this.lidToPnMap.set(jid, phone);
-            return phone;
+          const phoneAttr = contactNode?.attrs?.phone || userNode?.attrs?.jid || userNode?.attrs?.phone_number;
+          if (phoneAttr) {
+            const phone = extractPhoneNumberFromJid(phoneAttr);
+            if (phone) {
+              this.lidToPnMap.set(jid, phone);
+              return phone;
+            }
           }
         }
       } catch (err: any) {
-        console.warn(`[WhatsApp Bot] USync LID lookup notice for ${jid}:`, err.message);
+        // Notice
       }
     }
 
@@ -276,7 +277,7 @@ export class WhatsAppBot {
     console.log(`[WhatsApp Bot] Raw Participant JID: ${participantJid} ${isLidJid(participantJid) ? '(LID Privacy Mode)' : ''}`);
 
     // Resolve real phone number from JID / LID
-    const phone = await this.resolvePhoneFromJid(participantJid, rawReq);
+    const phone = await this.resolvePhoneFromJid(participantJid, rawReq, groupJid);
 
     if (!phone) {
       console.log(`[WhatsApp Bot] ⚠️ Could not resolve Phone Number from LID "${participantJid}". Leaving request pending for admin review.`);
@@ -353,15 +354,20 @@ export class WhatsAppBot {
     let totalPending = 0;
 
     try {
-      const groups = await this.sock.groupFetchAllParticipating();
+      const groups = await withTimeout(this.sock.groupFetchAllParticipating(), 10000, {});
       const groupList = Object.values(groups);
       totalGroups = groupList.length;
 
-      for (const group of groupList) {
+      for (let i = 0; i < groupList.length; i++) {
+        const group = groupList[i];
         try {
-          const pendingList = await this.fetchPendingRequestsForGroup(group.id);
+          console.log(`[WhatsApp Bot] [${i + 1}/${totalGroups}] Checking group "${group.subject}"...`);
+
+          // Fetch pending requests with 5-second timeout wrapper so no group ever freezes execution
+          const pendingList = await withTimeout(this.sock.groupRequestParticipantsList(group.id), 5000, []);
+
           if (pendingList && pendingList.length > 0) {
-            console.log(`[WhatsApp Bot] Found ${pendingList.length} pending request(s) in group: "${group.subject}" (${group.id})`);
+            console.log(`[WhatsApp Bot] 👥 Found ${pendingList.length} pending request(s) in group: "${group.subject}" (${group.id})`);
             totalPending += pendingList.length;
 
             for (const req of pendingList) {
@@ -370,14 +376,20 @@ export class WhatsAppBot {
             }
           }
         } catch (err: any) {
-          // Group might not have join approval turned on or bot is not admin
+          // Individual group query notice
         }
       }
     } catch (err: any) {
       console.error('[WhatsApp Bot] Error fetching group list:', err.message);
     }
 
-    console.log(`[WhatsApp Bot] Scan Complete. Managed Groups: ${totalGroups}, Approved: ${totalApproved}, Total Pending Remaining: ${totalPending - totalApproved}`);
+    console.log(`\n======================================================`);
+    console.log(`[WhatsApp Bot] Scan Complete!`);
+    console.log(`  • Managed Groups: ${totalGroups}`);
+    console.log(`  • Automatically Approved: ${totalApproved}`);
+    console.log(`  • Remaining Pending: ${totalPending - totalApproved}`);
+    console.log(`======================================================\n`);
+
     return { totalGroups, totalApproved, totalPending };
   }
 
@@ -440,16 +452,16 @@ export class WhatsAppBot {
     } else if (command === '!pending') {
       let responseText = `📋 *Pending Group Join Requests*\n\n`;
       try {
-        const groups = await this.sock.groupFetchAllParticipating();
+        const groups = await withTimeout(this.sock.groupFetchAllParticipating(), 10000, {});
         let totalCount = 0;
         for (const group of Object.values(groups)) {
           try {
-            const pending = await this.fetchPendingRequestsForGroup(group.id);
+            const pending = await withTimeout(this.sock.groupRequestParticipantsList(group.id), 5000, []);
             if (pending && pending.length > 0) {
               responseText += `👥 *${group.subject}* (${pending.length} pending):\n`;
               for (const req of pending) {
                 const rawJid = req.jid || req.participant;
-                const phone = await this.resolvePhoneFromJid(rawJid, req);
+                const phone = await this.resolvePhoneFromJid(rawJid, req, group.id);
                 responseText += `   - ${phone ? formatPhoneForDisplay(phone) : rawJid}\n`;
                 totalCount++;
               }
