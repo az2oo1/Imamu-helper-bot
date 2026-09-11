@@ -3,11 +3,26 @@
  */
 
 /**
- * Extracts raw numeric phone number from a WhatsApp JID or user identifier string.
+ * Checks if a JID is a WhatsApp Limited Identity (LID) JID (e.g. 113164452651106@lid)
+ */
+export function isLidJid(jid: string): boolean {
+  if (!jid) return false;
+  return jid.endsWith('@lid');
+}
+
+/**
+ * Extracts raw numeric phone number from a WhatsApp JID string.
  * Example: '966512345678:12@s.whatsapp.net' => '966512345678'
+ * Returns empty string if the JID is an LID (@lid) because LIDs are NOT phone numbers.
  */
 export function extractPhoneNumberFromJid(jid: string): string {
   if (!jid) return '';
+
+  // If it's an LID JID (e.g. 113164452651106@lid), do NOT treat the LID as a phone number!
+  if (isLidJid(jid)) {
+    return '';
+  }
+
   const unparsed = jid.split('@')[0].split(':')[0];
   return unparsed.replace(/\D/g, '');
 }
@@ -69,6 +84,7 @@ export function generatePhoneVariations(rawPhone: string): string[] {
  */
 export function formatPhoneForDisplay(phone: string): string {
   const digits = sanitizePhone(phone);
+  if (!digits) return 'Unknown';
   if (digits.startsWith('966') && digits.length === 12) {
     return `+966 ${digits.slice(3, 5)} ${digits.slice(5, 8)} ${digits.slice(8)}`;
   }

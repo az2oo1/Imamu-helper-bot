@@ -2,7 +2,9 @@ import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
   WASocket,
-  GroupMetadata,
+  getBinaryNodeChild,
+  getBinaryNodeChildren,
+  S_WHATSAPP_NET,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
@@ -11,13 +13,16 @@ import path from 'path';
 import fs from 'fs';
 import { config } from './config';
 import { db } from './db';
-import { extractPhoneNumberFromJid, formatPhoneForDisplay } from './phoneUtils';
+import { extractPhoneNumberFromJid, formatPhoneForDisplay, isLidJid } from './phoneUtils';
 
 export class WhatsAppBot {
   private sock: WASocket | null = null;
   private isConnected: boolean = false;
-  private logger = pino({ level: 'info' });
+  private logger = pino({ level: 'warn' });
   private authFolder = path.join(__dirname, '../auth_info_baileys');
+
+  // In-memory cache mapping WhatsApp LID JIDs (e.g. 113164452651106@lid) -> Phone Numbers
+  private lidToPnMap: Map<string, string> = new Map();
 
   constructor() {
     if (!fs.existsSync(this.authFolder)) {
@@ -33,6 +38,10 @@ export class WhatsAppBot {
       auth: state,
       printQRInTerminal: !config.bot.usePairingCode,
       logger: this.logger as any,
+      syncFullHistory: false,    // Disable full history download to prevent 408 init query timeouts
+      fireInitQueries: false,    // Skip optional init queries for faster & stable connection
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
     });
 
     this.sock.ev.on('creds.update', saveCreds);
@@ -67,6 +76,9 @@ export class WhatsAppBot {
         console.log(`  Bot Phone JID: ${this.sock?.user?.id}`);
         console.log('======================================================\n');
 
+        // Populate LID -> Phone map from existing group metadata
+        await this.refreshLidMapFromGroups();
+
         // Trigger an initial check of pending requests in all groups
         await this.scanAndProcessAllPendingRequests();
       }
@@ -92,7 +104,7 @@ export class WhatsAppBot {
     this.sock.ev.on('group-membership-request' as any, async (requests: any) => {
       const requestList = Array.isArray(requests) ? requests : [requests];
       for (const req of requestList) {
-        await this.handleSingleJoinRequest(req.id, req.participant, req.action || 'add');
+        await this.handleSingleJoinRequest(req.id, req.participant || req.jid, req.action || 'add', req);
       }
     });
 
@@ -107,16 +119,131 @@ export class WhatsAppBot {
   }
 
   /**
+   * Refreshes in-memory LID to Phone Number map by fetching group metadata across all participating groups.
+   */
+  private async refreshLidMapFromGroups(): Promise<void> {
+    if (!this.sock || !this.isConnected) return;
+    try {
+      const groups = await this.sock.groupFetchAllParticipating();
+      for (const group of Object.values(groups)) {
+        if (group.participants) {
+          for (const p of group.participants) {
+            const phone = extractPhoneNumberFromJid(p.id || p.jid || '');
+            if (p.lid && phone) {
+              this.lidToPnMap.set(p.lid, phone);
+            }
+          }
+        }
+      }
+      console.log(`[WhatsApp Bot] 📇 Cached ${this.lidToPnMap.size} LID-to-Phone mapping(s) from groups.`);
+    } catch (err: any) {
+      console.warn('[WhatsApp Bot] Warning: Could not cache LID map from groups:', err.message);
+    }
+  }
+
+  /**
+   * Resolves a JID (which may be an LID or a standard @s.whatsapp.net JID) into a numeric phone number.
+   */
+  private async resolvePhoneFromJid(jid: string, rawRequestObj?: any): Promise<string> {
+    if (!jid) return '';
+
+    // 1. If extra properties contain explicit phone number / PN attribute
+    if (rawRequestObj) {
+      const explicitPn = rawRequestObj.phone_number || rawRequestObj.pn || rawRequestObj.participant_pn || rawRequestObj.jid_pn || rawRequestObj.user_pn;
+      if (explicitPn) {
+        const phone = extractPhoneNumberFromJid(explicitPn);
+        if (phone) return phone;
+      }
+    }
+
+    // 2. If JID is a standard user JID (@s.whatsapp.net or @c.us)
+    if (!isLidJid(jid)) {
+      return extractPhoneNumberFromJid(jid);
+    }
+
+    // 3. If JID is an LID (@lid), check in-memory cached map
+    if (this.lidToPnMap.has(jid)) {
+      return this.lidToPnMap.get(jid)!;
+    }
+
+    // 4. Perform USync IQ query to WhatsApp server to resolve LID -> Phone Number
+    if (this.sock) {
+      try {
+        const result = await this.sock.query({
+          tag: 'iq',
+          attrs: {
+            to: S_WHATSAPP_NET,
+            type: 'get',
+            xmlns: 'usync'
+          },
+          content: [
+            {
+              tag: 'usync',
+              attrs: {
+                context: 'interactive',
+                mode: 'query',
+                sid: this.sock.generateMessageTag(),
+                last: 'true',
+                index: '0'
+              },
+              content: [
+                { tag: 'query', attrs: {}, content: [{ tag: 'contact', attrs: {} }] },
+                {
+                  tag: 'list',
+                  attrs: {},
+                  content: [
+                    {
+                      tag: 'user',
+                      attrs: { jid },
+                      content: [{ tag: 'contact', attrs: {} }]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        });
+
+        const usyncNode = getBinaryNodeChild(result, 'usync');
+        const listNode = getBinaryNodeChild(usyncNode, 'list');
+        const userNode = getBinaryNodeChild(listNode, 'user');
+        const contactNode = getBinaryNodeChild(userNode, 'contact');
+
+        const phoneAttr = contactNode?.attrs?.phone || userNode?.attrs?.jid || userNode?.attrs?.phone_number;
+        if (phoneAttr) {
+          const phone = extractPhoneNumberFromJid(phoneAttr);
+          if (phone) {
+            this.lidToPnMap.set(jid, phone);
+            return phone;
+          }
+        }
+      } catch (err: any) {
+        console.warn(`[WhatsApp Bot] USync LID lookup notice for ${jid}:`, err.message);
+      }
+    }
+
+    return '';
+  }
+
+  /**
    * Process a single participant group join request.
    */
-  private async handleSingleJoinRequest(groupJid: string, participantJid: string, action: string): Promise<boolean> {
+  private async handleSingleJoinRequest(groupJid: string, participantJid: string, action: string, rawReq?: any): Promise<boolean> {
     if (!this.sock) return false;
 
-    const phone = extractPhoneNumberFromJid(participantJid);
-    const displayPhone = formatPhoneForDisplay(phone);
-
     console.log(`\n[WhatsApp Bot] 📥 Join Request detected in group ${groupJid}`);
-    console.log(`[WhatsApp Bot] Candidate Phone: ${displayPhone} (${participantJid})`);
+    console.log(`[WhatsApp Bot] Raw Participant JID: ${participantJid} ${isLidJid(participantJid) ? '(LID Privacy Mode)' : ''}`);
+
+    // Resolve real phone number from JID / LID
+    const phone = await this.resolvePhoneFromJid(participantJid, rawReq);
+
+    if (!phone) {
+      console.log(`[WhatsApp Bot] ⚠️ Could not resolve Phone Number from LID "${participantJid}". Leaving request pending for admin review.`);
+      return false;
+    }
+
+    const displayPhone = formatPhoneForDisplay(phone);
+    console.log(`[WhatsApp Bot] Candidate Resolved Phone: ${displayPhone}`);
 
     // Lookup user in Imamu Helper DB
     const lookup = await db.findUserByPhone(phone);
@@ -149,7 +276,7 @@ export class WhatsAppBot {
         });
       } catch (e) {}
     } else {
-      console.log(`[WhatsApp Bot] ❌ User NOT found in Database.`);
+      console.log(`[WhatsApp Bot] ❌ User (${displayPhone}) NOT found in Database.`);
 
       if (config.bot.autoRejectUnrecognized) {
         try {
@@ -197,7 +324,7 @@ export class WhatsAppBot {
             totalPending += pendingList.length;
 
             for (const req of pendingList) {
-              const approved = await this.handleSingleJoinRequest(group.id, req.jid, 'add');
+              const approved = await this.handleSingleJoinRequest(group.id, req.jid || req.participant, 'add', req);
               if (approved) totalApproved++;
             }
           }
@@ -220,7 +347,7 @@ export class WhatsAppBot {
     if (!this.sock) return;
 
     const senderJid = msg.key.remoteJid || '';
-    const senderPhone = extractPhoneNumberFromJid(senderJid);
+    const senderPhone = await this.resolvePhoneFromJid(senderJid, msg.key);
     const body = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
 
     if (!body.startsWith('!')) return;
@@ -234,13 +361,14 @@ export class WhatsAppBot {
     const command = parts[0].toLowerCase();
     const args = parts.slice(1);
 
-    console.log(`[WhatsApp Bot] Command received: "${body}" from ${senderPhone}`);
+    console.log(`[WhatsApp Bot] Command received: "${body}" from ${senderPhone || senderJid}`);
 
     if (command === '!status') {
       const dbConnected = await db.checkConnection();
       const text = `🤖 *Imamu Helper WhatsApp Bot Status*\n\n` +
         `• Status: *Connected* ✅\n` +
         `• DB Connection: *${dbConnected ? 'Online ✅' : 'Offline ❌'}*\n` +
+        `• Cached LIDs: *${this.lidToPnMap.size}*\n` +
         `• Auto Reject Unrecognized: *${config.bot.autoRejectUnrecognized ? 'Enabled 🔴' : 'Disabled (Pending Mode) 🟡'}*\n` +
         `• Bot JID: \`${this.sock.user?.id}\``;
       await this.sock.sendMessage(senderJid, { text });
@@ -279,8 +407,9 @@ export class WhatsAppBot {
             if (pending && pending.length > 0) {
               responseText += `👥 *${group.subject}* (${pending.length} pending):\n`;
               for (const req of pending) {
-                const phone = extractPhoneNumberFromJid(req.jid);
-                responseText += `   - +${phone}\n`;
+                const rawJid = req.jid || req.participant;
+                const phone = await this.resolvePhoneFromJid(rawJid, req);
+                responseText += `   - ${phone ? formatPhoneForDisplay(phone) : rawJid}\n`;
                 totalCount++;
               }
               responseText += `\n`;
@@ -309,6 +438,7 @@ export class WhatsAppBot {
     return {
       connected: this.isConnected,
       botJid: this.sock?.user?.id || null,
+      cachedLids: this.lidToPnMap.size,
     };
   }
 }
