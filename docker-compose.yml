@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  whatsapp-bot:
+    image: ${BOT_IMAGE:-ghcr.io/az2oo1/imamu-helper-bot:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: imamu_whatsapp_bot
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - NODE_ENV=production
+      # Imamu Helper Database configuration
+      - DATABASE_URL=${DATABASE_URL:-postgresql://root@100.70.48.23:26257/defaultdb?sslmode=disable}
+      - SQL_HOST=${SQL_HOST:-100.70.48.23}
+      - SQL_PORT=${SQL_PORT:-26257}
+      - SQL_USER=${SQL_USER:-root}
+      - SQL_PASSWORD=${SQL_PASSWORD:-}
+      - SQL_DB_NAME=${SQL_DB_NAME:-defaultdb}
+      - SQL_SSL=${SQL_SSL:-false}
+      # Bot Behavior
+      - AUTO_REJECT_UNRECOGNIZED=${AUTO_REJECT_UNRECOGNIZED:-false}
+      - ADMIN_NUMBERS=${ADMIN_NUMBERS:-}
+      - USE_PAIRING_CODE=${USE_PAIRING_CODE:-false}
+      - PAIRING_PHONE_NUMBER=${PAIRING_PHONE_NUMBER:-}
+    volumes:
+      # Persist WhatsApp authentication state across container restarts
+      - whatsapp_bot_auth:/app/auth_info_baileys
+
+volumes:
+  whatsapp_bot_auth:
+    driver: local
