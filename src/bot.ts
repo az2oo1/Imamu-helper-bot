@@ -34,6 +34,7 @@ export class WhatsAppBot {
   private isConnected: boolean = false;
   private logger = pino({ level: 'warn' });
   private authFolder = path.join(__dirname, '../auth_info_baileys');
+  private periodicScanTimer: NodeJS.Timeout | null = null;
 
   // In-memory cache mapping WhatsApp LID JIDs (e.g. 113164452651106@lid) -> Phone Numbers
   private lidToPnMap: Map<string, string> = new Map();
@@ -72,6 +73,8 @@ export class WhatsAppBot {
 
       if (connection === 'close') {
         this.isConnected = false;
+        if (this.periodicScanTimer) clearInterval(this.periodicScanTimer);
+
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
@@ -94,6 +97,9 @@ export class WhatsAppBot {
 
         // Trigger an initial check of pending requests in all groups
         await this.scanAndProcessAllPendingRequests();
+
+        // Setup periodic 12-hour background scan safety net
+        this.setupPeriodicScan(12 * 60 * 60 * 1000);
       }
     });
 
@@ -121,6 +127,22 @@ export class WhatsAppBot {
       }
     });
 
+    // Event Listener: When bot is added to a NEW group
+    this.sock.ev.on('groups.upsert', async (newGroups) => {
+      for (const group of newGroups) {
+        console.log(`\n[WhatsApp Bot] 🆕 Bot added to NEW group: "${group.subject}" (${group.id})`);
+        await this.fetchGroupLidMap(group.id);
+        // Automatically scan pending requests for this newly added group
+        const pending = await withTimeout(this.sock!.groupRequestParticipantsList(group.id), 5000, []);
+        if (pending && pending.length > 0) {
+          console.log(`[WhatsApp Bot] Found ${pending.length} pending request(s) in newly added group "${group.subject}"`);
+          for (const req of pending) {
+            await this.handleSingleJoinRequest(group.id, req.jid || req.participant, 'add', req);
+          }
+        }
+      }
+    });
+
     // Event Listener: Admin Chat Commands
     this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
@@ -129,6 +151,18 @@ export class WhatsAppBot {
         await this.handleIncomingMessage(msg);
       }
     });
+  }
+
+  /**
+   * Sets up a periodic background scan timer (default: every 12 hours).
+   */
+  private setupPeriodicScan(intervalMs: number): void {
+    if (this.periodicScanTimer) clearInterval(this.periodicScanTimer);
+    console.log(`[WhatsApp Bot] ⏱️ Periodic background group scan scheduled every ${intervalMs / (1000 * 60 * 60)} hours.`);
+    this.periodicScanTimer = setInterval(async () => {
+      console.log(`[WhatsApp Bot] ⏰ Running scheduled 12-hour background group scan...`);
+      await this.scanAndProcessAllPendingRequests();
+    }, intervalMs);
   }
 
   /**
@@ -180,7 +214,7 @@ export class WhatsAppBot {
 
     // 1. If extra properties contain explicit phone number / PN attribute
     if (rawRequestObj) {
-      const explicitPn = rawRequestObj.phone_number || rawRequestObj.pn || rawRequestObj.participant_pn || rawRequestObj.jid_pn || rawRequestObj.user_pn;
+      const explicitPn = rawRequestObj.phone_number || rawRequestObj.pn || rawRequestObj.participant_pn || rawRequestObj.participantPn || rawRequestObj.jid_pn || rawRequestObj.user_pn;
       if (explicitPn) {
         const phone = extractPhoneNumberFromJid(explicitPn);
         if (phone) return phone;
