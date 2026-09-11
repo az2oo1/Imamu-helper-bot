@@ -142,6 +142,47 @@ export class WhatsAppBot {
   }
 
   /**
+   * Fetch all pending membership approval requests for a group, specifying limit=100 to ensure complete lists.
+   */
+  public async fetchPendingRequestsForGroup(groupJid: string): Promise<any[]> {
+    if (!this.sock) return [];
+
+    // Try sending explicit limit=100 query first to prevent WhatsApp default result capping
+    try {
+      const result = await this.sock.query({
+        tag: 'iq',
+        attrs: {
+          type: 'get',
+          xmlns: 'w:g2',
+          to: groupJid
+        },
+        content: [
+          {
+            tag: 'membership_approval_requests',
+            attrs: { limit: '100' }
+          }
+        ]
+      });
+
+      const node = getBinaryNodeChild(result, 'membership_approval_requests');
+      const participants = getBinaryNodeChildren(node, 'membership_approval_request');
+      const list = participants.map(v => v.attrs);
+      if (list && list.length > 0) {
+        return list;
+      }
+    } catch (err) {
+      // Query with limit notice
+    }
+
+    // Fallback to standard Baileys method if custom limit query fails or returns empty
+    try {
+      return await this.sock.groupRequestParticipantsList(groupJid);
+    } catch (err) {
+      return [];
+    }
+  }
+
+  /**
    * Resolves a JID (which may be an LID or a standard @s.whatsapp.net JID) into a numeric phone number.
    */
   private async resolvePhoneFromJid(jid: string, rawRequestObj?: any): Promise<string> {
@@ -318,7 +359,7 @@ export class WhatsAppBot {
 
       for (const group of groupList) {
         try {
-          const pendingList = await this.sock.groupRequestParticipantsList(group.id);
+          const pendingList = await this.fetchPendingRequestsForGroup(group.id);
           if (pendingList && pendingList.length > 0) {
             console.log(`[WhatsApp Bot] Found ${pendingList.length} pending request(s) in group: "${group.subject}" (${group.id})`);
             totalPending += pendingList.length;
@@ -403,7 +444,7 @@ export class WhatsAppBot {
         let totalCount = 0;
         for (const group of Object.values(groups)) {
           try {
-            const pending = await this.sock.groupRequestParticipantsList(group.id);
+            const pending = await this.fetchPendingRequestsForGroup(group.id);
             if (pending && pending.length > 0) {
               responseText += `👥 *${group.subject}* (${pending.length} pending):\n`;
               for (const req of pending) {
