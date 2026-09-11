@@ -16,31 +16,22 @@ A specialized WhatsApp Bot for **Imamu Helper** that automatically handles Whats
   - `!check <phone>` - Manually search for a user by phone number in the database.
   - `!help` - Display available commands.
 - **REST Health Check API**: HTTP server endpoint `/health` and `/api/approve-all` for monitoring and integration.
-- **Automated CI/CD Workflow**: GitHub Actions workflow automatically builds and publishes production Docker images to GitHub Container Registry (`ghcr.io`).
-- **Docker Compose Setup**: Full containerization support with persistent volume storage (`whatsapp_bot_auth`) to save WhatsApp session logins across restarts.
+- **Automated CI/CD Workflow**: GitHub Actions workflow automatically builds and publishes production Docker images to GitHub Container Registry (`ghcr.io/az2oo1/imamu-helper-bot:latest`).
+- **Image-based Docker Compose Setup**: Pure container-image deployment with persistent volume storage (`whatsapp_bot_auth`) for WhatsApp authentication state across container restarts.
 
 ---
 
 ## 🚀 Quickstart with Docker Compose
 
-### Option A: Using the Published Container Image (Recommended)
-
-Simply start the container service using `docker compose`:
+Start the bot container using the published `ghcr.io/az2oo1/imamu-helper-bot:latest` image:
 
 ```bash
 docker compose up -d
 ```
 
-To view the QR Code in container output logs to authenticate WhatsApp:
+To view the QR Code in container logs to authenticate WhatsApp:
 ```bash
 docker compose logs -f
-```
-
-### Option B: Building Locally with Docker Compose
-
-To force a local build from source using Docker Compose:
-```bash
-docker compose up -d --build
 ```
 
 ---
@@ -50,8 +41,8 @@ docker compose up -d --build
 This repository includes an automated GitHub Actions workflow defined in [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml).
 
 ### Workflow Triggers:
-- **Push to `main` / `master`**: Automatically builds and publishes `ghcr.io/<owner>/imamu-helper-bot:latest`.
-- **Release Tags (`v*.*.*`)**: Builds and tags release versions (e.g. `ghcr.io/<owner>/imamu-helper-bot:v1.0.0`).
+- **Push to `main` / `master`**: Automatically builds and publishes `ghcr.io/az2oo1/imamu-helper-bot:latest`.
+- **Release Tags (`v*.*.*`)**: Builds and tags release versions (e.g. `ghcr.io/az2oo1/imamu-helper-bot:v1.0.0`).
 - **Pull Requests**: Builds the Docker image to verify compilation without pushing.
 - **Manual Trigger (`workflow_dispatch`)**: Allows manual workflow runs from GitHub Actions UI.
 
